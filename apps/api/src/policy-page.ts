@@ -23,6 +23,8 @@ button { margin: .25rem 0; }
 </form>
 <label>Policy JSON <textarea id="draft" rows="18" spellcheck="false"></textarea></label>
 <button id="review">Validate and review</button>
+<p id="effectiveDate" style="font-size:1.5rem;font-weight:bold" aria-live="polite"></p>
+<p id="immediateWarning" role="alert" style="font-weight:bold;color:#a00"></p>
 <button id="approve" disabled>Approve reviewed version</button>
 <pre id="reviewStatus" role="status"></pre>
 <ul id="changes"></ul>
@@ -79,6 +81,8 @@ function invalidateReview() {
   approve.disabled = true;
   changes.replaceChildren();
   reviewStatus.textContent = "";
+  byId("effectiveDate").textContent = "";
+  byId("immediateWarning").textContent = "";
 }
 for (const id of ["draft", "base", "csv"])
   byId(id).addEventListener("input", invalidateReview);
@@ -140,6 +144,8 @@ byId("review").onclick = async () => {
     const result = await api("/api/policies/review", input);
     if (requestRevision !== revision) return;
     reviewed = input;
+    byId("effectiveDate").textContent = "Effective date: " + result.effective.effectiveDate;
+    byId("immediateWarning").textContent = result.effective.immediate ? "This takes effect immediately." : "";
     approve.disabled = approving;
     for (const change of result.changes) {
       const item = document.createElement("li");

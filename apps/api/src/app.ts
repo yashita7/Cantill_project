@@ -29,6 +29,7 @@ import { setupPage } from "./page.js";
 import { policyPage } from "./policy-page.js";
 import {
   describeChanges,
+  effectiveDateNotice,
   parseDraft,
   sourceSchema,
   type ExtractPolicy,
@@ -255,6 +256,10 @@ export function buildApp(
       draft,
       changes: describeChanges(before, draft),
       impact: amendmentImpact(draft, requirementDates),
+      effective: effectiveDateNotice(
+        draft.effective_date,
+        DateTime.now().setZone("Asia/Kolkata").toISODate()!,
+      ),
     };
   };
   app.get("/policies", async (_req, reply) =>

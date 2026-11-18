@@ -214,3 +214,8 @@ export function describeChanges(
     );
   return changes;
 }
+
+// ISO calendar dates compare in chronological order after validation.
+export function effectiveDateNotice(effectiveDate: string, todayIst: string) {
+  return { effectiveDate, immediate: effectiveDate <= todayIst };
+}

@@ -290,6 +290,20 @@ it("reviews and applies two amendments through approved policy selection", async
       baseVersion: base.version,
       batch: { csv },
     });
+    expect(review.effective).toMatchObject({
+      effectiveDate: "2026-04-02",
+      immediate: true,
+    });
+    const futureReview = await post("/api/policies/review", {
+      draft: { ...limitDraft, effective_date: "2099-01-01" },
+    });
+    expect(futureReview.effective).toEqual({
+      effectiveDate: "2099-01-01",
+      immediate: false,
+    });
+    const page = (await app.inject("/policies")).body;
+    expect(page).toContain("This takes effect immediately.");
+    expect(page).toContain("font-size:1.5rem");
     expect(review.changes.join(" ")).toContain(
       'spot changes from "200000" to "10"',
     );

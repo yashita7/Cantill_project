@@ -142,3 +142,9 @@ This check runs entirely on your laptop. It needs Node.js 22 or newer, the unmod
 4. The command starts the API in the same process as a temporary PGlite database. It imports the local master CSVs, contract register, private supplement and policy through the setup API. It then sends the sample batch as a multipart upload to the process-batch API and downloads its decision CSV.
 5. The command runs the CLI on the same inputs and compares every row and column. It also compares the API and CLI preferred-supplier exports for 1 November 2026. The command prints the expected row count for each matching export. If there is a difference, it prints the first ten differing rows and column names and exits with an error. A wrong row count also causes an error.
 6. Find all four CSVs in `private/local-verification/`. That folder is ignored by Git. The temporary database is discarded when the command finishes. The API is exercised through Fastify's in-process HTTP request interface, so no local port or external account is needed.
+
+To clear the app's database records manually, run `npm run reset:db` and type
+`RESET` at the prompt. This permanently deletes the app's snapshots, policies,
+requests, runs, orders, and audit records in the database selected by
+`DATABASE_URL`. Any other response cancels. Restart the app afterward to create
+an empty table. This command is never run by setup or verification.
