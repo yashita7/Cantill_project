@@ -29,22 +29,171 @@ export type ChatDraft = {
 export type ExtractChat = (
   message: string,
   draft: ChatDraft,
+  context?: { requestId: string },
 ) => Promise<Fields>;
 
-export function geminiChat(apiKey: string, model: string): ExtractChat {
-  const ai = new GoogleGenAI({ apiKey, httpOptions: { timeout: 30000 } });
-  return async (message, draft) => {
-    const response = await ai.models.generateContent({
-      model,
-      contents: JSON.stringify({ message, draft }),
-      config: {
-        systemInstruction:
-          "Extract every field explicitly supplied or corrected by the user in this message, including plant codes such as PUN1 or CHK1 and need-by dates. Return a partial update. Never invent item codes, units, prices, quantities or dates. Preserve relative date wording verbatim in needBy. For a short answer use the draft's missing fields as context. 'make it 300' corrects quantity. Use Normal or Emergency only when the wording supplies that urgency.",
-        responseMimeType: "application/json",
-        responseJsonSchema: z.toJSONSchema(fieldsSchema),
+export type ChatErrorCategory =
+  | "configuration"
+  | "model_not_found"
+  | "rate_limit"
+  | "service_unavailable"
+  | "timeout"
+  | "invalid_json"
+  | "validation"
+  | "internal";
+
+export class ChatError extends Error {
+  logged = false;
+  constructor(
+    public category: ChatErrorCategory,
+    public upstreamStatus?: number,
+    public retryAfterMs?: number,
+  ) {
+    super(category);
+  }
+}
+
+export function classifyChatError(error: unknown): ChatError {
+  if (error instanceof ChatError) return error;
+  if (error instanceof z.ZodError) return new ChatError("validation");
+  if (error instanceof SyntaxError) return new ChatError("invalid_json");
+  if (
+    error instanceof Error &&
+    (error.name === "AbortError" || error.name === "TimeoutError")
+  )
+    return new ChatError("timeout");
+  const status =
+    typeof error === "object" &&
+    error !== null &&
+    "status" in error &&
+    typeof error.status === "number"
+      ? error.status
+      : undefined;
+  if (status === 404) return new ChatError("model_not_found", status);
+  if (status === 401 || status === 403)
+    return new ChatError("configuration", status);
+  if (status === 429) return new ChatError("rate_limit", status);
+  if (status === 503) return new ChatError("service_unavailable", status);
+  return new ChatError("internal", status);
+}
+
+export function chatRetryable(error: ChatError): boolean {
+  return [
+    "rate_limit",
+    "service_unavailable",
+    "timeout",
+    "invalid_json",
+    "validation",
+    "internal",
+  ].includes(error.category);
+}
+
+export function logChatFailure(
+  error: ChatError,
+  requestId: string,
+  model?: string,
+) {
+  // Only fixed categories and non-sensitive metadata are logged; never the error body.
+  console.error(
+    JSON.stringify({
+      event: "gemini_chat_failure",
+      timestamp: new Date().toISOString(),
+      requestId,
+      category: error.category,
+      upstreamStatus: error.upstreamStatus ?? null,
+      model: model ?? null,
+      apiVersion: process.env.GOOGLE_GENAI_API_VERSION || null,
+      retryable: chatRetryable(error),
+    }),
+  );
+  error.logged = true;
+}
+
+function retryAfter(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
+}
+
+export function geminiChat(
+  apiKey: string,
+  model: string,
+  options: {
+    fetch?: typeof fetch;
+    sleep?: (ms: number) => Promise<void>;
+    random?: () => number;
+    timeoutMs?: number;
+  } = {},
+): ExtractChat {
+  return async (message, draft, context) => {
+    if (!apiKey.trim() || !model.trim()) throw new ChatError("configuration");
+    const timeoutMs = options.timeoutMs ?? 30000;
+    const deadline = Date.now() + timeoutMs;
+    const signal = AbortSignal.timeout(timeoutMs);
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        timeout: timeoutMs,
+        fetch: async (input, init) => {
+          const response = await (options.fetch ?? fetch)(input, init);
+          // The SDK's ApiError drops headers, so capture Retry-After before it does.
+          if (!response.ok)
+            throw new ChatError(
+              response.status === 404
+                ? "model_not_found"
+                : response.status === 401 || response.status === 403
+                  ? "configuration"
+                  : response.status === 429
+                    ? "rate_limit"
+                    : response.status === 503
+                      ? "service_unavailable"
+                      : "internal",
+              response.status,
+              retryAfter(response.headers.get("retry-after")),
+            );
+          return response;
+        },
       },
     });
-    return fieldsSchema.parse(JSON.parse(response.text ?? ""));
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: JSON.stringify({ message, draft }),
+          config: {
+            abortSignal: signal,
+            systemInstruction:
+              "Extract every field explicitly supplied or corrected by the user in this message, including plant codes such as PUN1 or CHK1 and need-by dates. Return a partial update. Never invent item codes, units, prices, quantities or dates. Preserve relative date wording verbatim in needBy. For a short answer use the draft's missing fields as context. 'make it 300' corrects quantity. Use Normal or Emergency only when the wording supplies that urgency.",
+            responseMimeType: "application/json",
+            responseJsonSchema: z.toJSONSchema(fieldsSchema),
+          },
+        });
+        return fieldsSchema.parse(JSON.parse(response.text ?? ""));
+      } catch (cause) {
+        const error = signal.aborted
+          ? new ChatError("timeout")
+          : classifyChatError(cause);
+        logChatFailure(error, context?.requestId ?? "unavailable", model);
+        if (
+          attempt >= 2 ||
+          !["rate_limit", "service_unavailable"].includes(error.category)
+        )
+          throw error;
+        const delay = Math.max(
+          error.retryAfterMs ?? 0,
+          Math.floor((options.random ?? Math.random)() * 500 * 2 ** attempt),
+        );
+        if (delay >= deadline - Date.now()) throw error;
+        await (
+          options.sleep ??
+          ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
+        )(delay);
+        if (signal.aborted || Date.now() >= deadline)
+          throw new ChatError("timeout");
+      }
+    }
   };
 }
 

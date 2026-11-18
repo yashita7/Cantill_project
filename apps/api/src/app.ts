@@ -19,12 +19,15 @@ import {
   preferredCsv,
   parseCsv,
   snapshotFromFiles,
+  BatchCsvValidationError,
+  CsvFormatError,
 } from "../../../packages/cli/src/io.js";
 import { records, type Database } from "./db.js";
 import { buyerRoutes } from "./buyer.js";
 import { chatRoutes } from "./chat-routes.js";
 import type { ExtractChat } from "./chat.js";
 import { chatPage } from "./chat-page.js";
+import { DrizzleQueryError } from "drizzle-orm/errors";
 import { homePage } from "./home-page.js";
 import { styles } from "./ui/styles.js";
 import { setupPage } from "./page.js";
@@ -53,22 +56,136 @@ export function buildApp(
     { parseAs: "buffer" },
     (_req, body, done) => done(null, body),
   );
+  // Only these fixed, application-authored messages may cross the error boundary.
+  const knownErrors = new Set([
+    "snapshot not found",
+    "run not found",
+    "policy not found",
+    "requirement not found",
+    "Snapshot not found",
+    "Chat not found",
+    "Item not found",
+    "Upload the private v5.0 policy JSON for initial setup",
+    "Initial policy must be v5.0 effective 2026-04-01",
+    "Gemini is unavailable. Use the raw JSON editor.",
+    "Policy extraction failed. Retry or use the raw JSON editor.",
+    "Upload one CSV file in the file field",
+    "Import a snapshot before processing a batch",
+    "Approve a policy before processing batches.",
+    "Requirement has no actionable decision",
+    "A PO requires a supplier and nonnegative unit price",
+    "Choose one of the displayed candidates",
+    "Enter a message",
+    "Complete the request before confirming.",
+    "Contract supplement must be valid JSON",
+    "Duplicate CSV column names",
+    "The CSV contains no PR lines",
+  ]);
   app.setErrorHandler((error, _request, reply) => {
-    if (error instanceof z.ZodError) {
-      return reply.code(400).send({ error: z.prettifyError(error) });
+    if (error instanceof CsvFormatError)
+      return reply
+        .code(422)
+        .send({
+          error: error.message,
+          details: [
+            { row: error.row, message: "Invalid CSV format or column count" },
+          ],
+        });
+    if (error instanceof BatchCsvValidationError) {
+      const details = error.columns.map((column) => ({
+        path: column,
+        row: error.row,
+        message: "Missing or invalid field",
+      }));
+      return reply.code(422).send({
+        error: `CSV row ${error.row}: ${error.columns.join(", ")}: Missing or invalid field`,
+        details,
+      });
     }
-    const dbError =
-      error !== null &&
+    if (error instanceof z.ZodError) {
+      // Paths and messages are selected from fixed schema names and fixed text;
+      // never echo input values, arbitrary record keys, or Zod's raw messages.
+      const fields = new Set(
+        "draft version effective_date approval actor at parameters club_days need_by_days consolidation_hours history_days preferred_days active_statuses emergency_labels valuation_sources limits ranking frequency recency contract delivery quality recent_days older_days older_score rules id clause when all any not op left right fact parameter action decision route supplier suggestions note selection mode execution_date snapshotId csv batch runId baseVersion source kind text actor name role files items suppliers history plants register lines supplement policy quantity plant uom description needBy urgency estimatedPrice created_at pr_no pr_line requester department item_code estimated_unit_price need_by_date revision message candidate confirm".split(
+          " ",
+        ),
+      );
+      const customMessages = new Set([
+        "Rule IDs must be unique",
+        "Comparison requires a right operand",
+        "PO requires a supplier strategy",
+        "Decision and route must agree",
+        "Ordered comparisons require numeric facts, limits, or literals",
+        "Membership comparison requires an array",
+        "Expected a PDF file",
+      ]);
+      const details = error.issues.map((issue) => ({
+        path: issue.path.map((part) =>
+          typeof part === "number"
+            ? part
+            : fields.has(String(part))
+              ? String(part)
+              : "[key]",
+        ),
+        message:
+          issue.code === "custom" && customMessages.has(issue.message)
+            ? issue.message
+            : issue.code === "invalid_type"
+              ? "Required or incorrect type"
+              : issue.code === "too_small"
+                ? "Value is too small or missing"
+                : issue.code === "too_big"
+                  ? "Value is too large"
+                  : issue.code === "invalid_value"
+                    ? "Choose an allowed value"
+                    : issue.code === "unrecognized_keys"
+                      ? "Contains unrecognized fields"
+                      : "Invalid value",
+      }));
+      return reply.code(400).send({
+        error: details
+          .map((d) => `${d.path.join(".") || "request"}: ${d.message}`)
+          .join("; "),
+        details,
+      });
+    }
+    if (
+      error instanceof Error &&
+      error.constructor === Error &&
+      knownErrors.has(error.message)
+    )
+      return reply.code(422).send({ error: error.message });
+    if (
+      error &&
       typeof error === "object" &&
-      "code" in error &&
-      typeof error.code === "string" &&
-      /^[0-9A-Z]{5}$/.test(error.code);
-    const message = dbError
-      ? "Database operation failed"
-      : error instanceof Error
-        ? error.message
-        : "Request failed";
-    reply.code(dbError ? 500 : 422).send({ error: message });
+      "statusCode" in error &&
+      typeof error.statusCode === "number" &&
+      error.statusCode >= 400 &&
+      error.statusCode < 500
+    )
+      return reply
+        .code(error.statusCode)
+        .send({ error: "Invalid request. Check the supplied fields." });
+    const dbError =
+      error instanceof DrizzleQueryError ||
+      (error !== null &&
+        typeof error === "object" &&
+        "code" in error &&
+        typeof error.code === "string" &&
+        /^[0-9A-Z]{5}$/.test(error.code));
+    const requestId = randomUUID();
+    console.error(
+      JSON.stringify({
+        event: "request_failure",
+        timestamp: new Date().toISOString(),
+        requestId,
+        category: dbError ? "database" : "internal",
+      }),
+    );
+    return reply.code(500).send({
+      error: "An unexpected error occurred. Please try again.",
+      requestId,
+    });
   });
   const get = async (id: string, kind: string) => {
     const [row] = await db.select().from(records).where(eq(records.id, id));
@@ -152,6 +269,11 @@ export function buildApp(
       })
       .parse(req.body);
     const f = body.files;
+    try {
+      JSON.parse(f.supplement);
+    } catch {
+      throw new Error("Contract supplement must be valid JSON");
+    }
     const snapshot = snapshotFromFiles(
       {
         items: parseCsv(f.items),

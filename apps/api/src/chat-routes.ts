@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { randomUUID } from "node:crypto";
-import { eq, and } from "drizzle-orm";
+import { eq, and, sql } from "drizzle-orm";
 import { DateTime } from "luxon";
 import { z } from "zod";
 import { snapshotSchema } from "@cantill/engine";
@@ -11,6 +11,10 @@ import {
   resolveDate,
   createLine,
   fieldsSchema,
+  ChatError,
+  classifyChatError,
+  chatRetryable,
+  logChatFailure,
   type ChatDraft,
   type ExtractChat,
 } from "./chat.js";
@@ -20,6 +24,39 @@ export function chatRoutes(
   db: Database,
   extract?: ExtractChat,
 ) {
+  app.get("/api/chat/:id", async (req) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    const [row] = await db
+      .select()
+      .from(records)
+      .where(and(eq(records.id, id), eq(records.kind, "chat")));
+    if (!row) throw new Error("Chat not found");
+    if (row.data.createdPr)
+      return { id, revision: row.data.revision, createdPr: row.data.createdPr };
+    const [stored] = await db
+      .select()
+      .from(records)
+      .where(eq(records.id, String(row.data.snapshotId)));
+    const state = inspect(
+      row.data.draft as ChatDraft,
+      snapshotSchema.parse(stored?.data),
+      DateTime.now().setZone("Asia/Kolkata").toFormat("yyyy-MM-dd"),
+    );
+    const unresolvedCorrections = Array.isArray(row.data.unresolvedCorrections)
+      ? row.data.unresolvedCorrections
+      : [];
+    return {
+      id,
+      revision: row.data.revision,
+      draft: row.data.draft,
+      ...state,
+      unresolvedCorrections,
+      ready:
+        state.ready &&
+        !row.data.pendingMessage &&
+        !unresolvedCorrections.length,
+    };
+  });
   app.post("/api/chat", async (req) => {
     const input = z
       .object({ snapshotId: z.string(), actor: z.string().trim().min(1) })
@@ -47,9 +84,21 @@ export function chatRoutes(
         message: z.string().max(10000).optional(),
         candidate: z.string().optional(),
         confirm: z.boolean().optional(),
+        retryCorrection: z.string().uuid().optional(),
+        discardCorrection: z.string().uuid().optional(),
+        acknowledgeDiscard: z.boolean().optional(),
       })
+      .refine(
+        (value) =>
+          Number(Boolean(value.message?.trim())) +
+            Number(Boolean(value.candidate)) +
+            Number(value.confirm === true) +
+            Number(Boolean(value.retryCorrection)) +
+            Number(Boolean(value.discardCorrection)) ===
+          1,
+      )
       .parse(req.body);
-    const [row] = await db
+    let [row] = await db
       .select()
       .from(records)
       .where(and(eq(records.id, id), eq(records.kind, "chat")));
@@ -60,6 +109,115 @@ export function chatRoutes(
       return reply
         .code(409)
         .send({ error: "Reload the latest draft before editing." });
+    type Correction = { id: string; text: string };
+    const unresolved = () =>
+      (Array.isArray(row.data.unresolvedCorrections)
+        ? row.data.unresolvedCorrections
+        : []) as Correction[];
+    if (
+      (input.confirm || input.candidate) &&
+      (row.data.pendingMessage || unresolved().length)
+    )
+      return reply.code(409).send({
+        error:
+          "Your latest message was not processed. Retry it before confirming or choosing an item.",
+      });
+    if (input.discardCorrection) {
+      if (input.acknowledgeDiscard !== true)
+        return reply.code(400).send({
+          error:
+            "Acknowledge that the saved draft will remain unchanged before discarding.",
+        });
+      if (!unresolved().some((c) => c.id === input.discardCorrection))
+        return reply
+          .code(409)
+          .send({ error: "Correction no longer exists. Reload the draft." });
+      const { pendingMessage, ...rest } = row.data;
+      const next = {
+        ...rest,
+        ...(pendingMessage && pendingMessage !== input.discardCorrection
+          ? { pendingMessage }
+          : {}),
+        unresolvedCorrections: unresolved().filter(
+          (c) => c.id !== input.discardCorrection,
+        ),
+        revision: input.revision + 1,
+      };
+      const updated = await db
+        .update(records)
+        .set({ data: next })
+        .where(and(eq(records.id, id), eq(records.data, row.data)))
+        .returning();
+      if (!updated.length)
+        return reply
+          .code(409)
+          .send({ error: "Draft changed. Reload before editing." });
+      const [snapshotRow] = await db
+        .select()
+        .from(records)
+        .where(eq(records.id, String(row.data.snapshotId)));
+      const snapshot = snapshotSchema.parse(snapshotRow?.data);
+      const state = inspect(
+        row.data.draft as ChatDraft,
+        snapshot,
+        DateTime.now().setZone("Asia/Kolkata").toFormat("yyyy-MM-dd"),
+      );
+      return {
+        id,
+        revision: next.revision,
+        draft: row.data.draft,
+        ...state,
+        unresolvedCorrections: next.unresolvedCorrections,
+        ready:
+          state.ready &&
+          !next.unresolvedCorrections.length &&
+          !next.pendingMessage,
+      };
+    }
+    let requestId: string | undefined;
+    let message = input.message;
+    if (input.retryCorrection) {
+      const correction = unresolved().find(
+        (c) => c.id === input.retryCorrection,
+      );
+      if (!correction)
+        return reply
+          .code(409)
+          .send({ error: "Correction no longer exists. Reload the draft." });
+      message = correction.text;
+    }
+    if (message) {
+      if (!message.trim()) throw new Error("Enter a message");
+      requestId = input.retryCorrection ?? randomUUID();
+      // Claim the latest message before calling Gemini. A concurrent newer claim
+      // replaces this marker; the older result can no longer commit.
+      const [claimed] = await db
+        .update(records)
+        .set({
+          data: input.retryCorrection
+            ? sql`${records.data} || jsonb_build_object('pendingMessage', ${requestId}::text)`
+            : sql`${records.data} || jsonb_build_object('pendingMessage', ${requestId}::text, 'unresolvedCorrections', coalesce(${records.data}->'unresolvedCorrections', '[]'::jsonb) || jsonb_build_array(jsonb_build_object('id', ${requestId}::text, 'text', ${message}::text)))`,
+        })
+        .where(
+          and(
+            eq(records.id, id),
+            eq(records.kind, "chat"),
+            sql`${records.data}->>'revision' = ${String(input.revision)}`,
+            sql`${records.data}->>'createdPr' IS NULL`,
+            ...(input.retryCorrection
+              ? [
+                  sql`${records.data}->'unresolvedCorrections' @> ${JSON.stringify([{ id: requestId }])}::jsonb`,
+                ]
+              : []),
+          ),
+        )
+        .returning();
+      if (!claimed)
+        return reply
+          .code(409)
+          .send({ error: "Draft changed. Reload before editing." });
+      row = claimed;
+    }
     const [stored] = await db
       .select()
       .from(records)
@@ -91,10 +249,53 @@ export function chatRoutes(
         fields: { ...draft.fields, uom: item.uom },
       };
     } else {
-      if (!input.message?.trim()) throw new Error("Enter a message");
+      if (!message?.trim() || !requestId) throw new Error("Enter a message");
+      let update;
       try {
-        if (!extract) throw new Error("Unavailable");
-        const update = fieldsSchema.parse(await extract(input.message, draft));
+        if (!extract) throw new ChatError("configuration");
+        update = fieldsSchema.parse(
+          await extract(message, draft, { requestId }),
+        );
+        if (
+          inspect(draft, snapshot, at.slice(0, 10)).ready &&
+          !Object.values(update).some((value) => value?.trim())
+        )
+          throw new ChatError("validation");
+      } catch (cause) {
+        const error = classifyChatError(cause);
+        // Production Gemini attempts are logged at the HTTP boundary; this also
+        // records missing configuration and validation failures in injected extractors.
+        if (!error.logged)
+          logChatFailure(error, requestId, process.env.GEMINI_MODEL);
+        const messages = {
+          configuration:
+            "AI chat is not configured correctly. Contact the administrator. Your draft is saved.",
+          model_not_found:
+            "The AI model configuration is unavailable. Contact the administrator. Your draft is saved.",
+          rate_limit:
+            "The AI rate limit has been reached. Please wait and retry this message. Your draft is saved.",
+          service_unavailable:
+            "The AI service is temporarily unavailable. Please retry this message. Your draft is saved.",
+          timeout:
+            "The AI request timed out. Please retry this message. Your draft is saved.",
+          invalid_json:
+            "The AI returned an invalid response. Please retry this message. Your draft is saved.",
+          validation:
+            "The AI returned an invalid response. Please retry this message. Your draft is saved.",
+          internal:
+            "Something went wrong on the server. Please retry this message. Your draft is saved.",
+        };
+        return reply.code(error.category === "internal" ? 500 : 503).send({
+          error:
+            messages[error.category] +
+            " Your latest message was not processed; the previous draft was not updated.",
+          retryable: chatRetryable(error),
+          draft,
+          revision: input.revision,
+          unresolvedCorrections: unresolved(),
+        });
+      }
+      try {
         const previous = inspect(draft, snapshot, at.slice(0, 10));
         if (update.needBy)
           update.needBy =
@@ -112,21 +313,37 @@ export function chatRoutes(
         )
           draft.newDescriptionConfirmed = false;
       } catch {
-        return reply.code(503).send({
+        logChatFailure(
+          new ChatError("internal"),
+          requestId,
+          process.env.GEMINI_MODEL,
+        );
+        return reply.code(500).send({
           error:
-            "Gemini is unavailable or its quota is exhausted. Your draft is saved. Retry this message.",
+            "Something went wrong on the server. Your latest message was not processed; the previous draft was not updated. Please retry.",
           retryable: true,
           draft,
           revision: input.revision,
+          unresolvedCorrections: unresolved(),
         });
       }
     }
     const revision = input.revision + 1;
     const state = inspect(draft, snapshot, at.slice(0, 10));
+    const { pendingMessage: _pendingMessage, ...completedData } = row.data;
+    const remaining = unresolved().filter((c) => c.id !== requestId);
     const changed = await db.transaction(async (tx) => {
       const updated = await tx
         .update(records)
-        .set({ data: { ...row.data, draft, revision, createdPr } })
+        .set({
+          data: {
+            ...completedData,
+            unresolvedCorrections: remaining,
+            draft,
+            revision,
+            createdPr,
+          },
+        })
         .where(and(eq(records.id, id), eq(records.data, row.data)))
         .returning();
       if (!updated.length) return false;
@@ -153,6 +370,14 @@ export function chatRoutes(
       return reply
         .code(409)
         .send({ error: "Draft changed. Reload before confirming." });
-    return { id, revision, draft, ...state, createdPr };
+    return {
+      id,
+      revision,
+      draft,
+      ...state,
+      ready: state.ready && remaining.length === 0,
+      unresolvedCorrections: remaining,
+      createdPr,
+    };
   });
 }

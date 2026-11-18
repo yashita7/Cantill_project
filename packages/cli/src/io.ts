@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { parse } from "csv-parse/sync";
+import { CsvError } from "csv-parse";
 import { stringify } from "csv-stringify/sync";
 import { DateTime } from "luxon";
 import {
@@ -27,22 +28,53 @@ export const outputColumns = [
   "reason",
 ];
 
+export class BatchCsvValidationError extends Error {
+  constructor(
+    public row: number,
+    public columns: string[],
+  ) {
+    super(`CSV row ${row}: ${columns.join(", ")}: Missing or invalid field`);
+  }
+}
+
+export class CsvFormatError extends Error {
+  constructor(public row: number | undefined) {
+    super(
+      row
+        ? `CSV row ${row}: Invalid CSV format or column count`
+        : "Invalid CSV format",
+    );
+  }
+}
+
 export function parseCsv(text: string): Record<string, string>[] {
-  return parse<Record<string, string>>(text, {
-    columns: (headers: string[]) => {
-      const cleaned = headers.map((header) => header.trim());
-      if (new Set(cleaned).size !== cleaned.length)
-        throw new Error("Duplicate CSV column names");
-      return cleaned;
-    },
-    skip_empty_lines: true,
-    bom: true,
-    trim: true,
-  }).map((row) =>
-    Object.fromEntries(
-      Object.entries(row).map(([key, value]) => [key, value.trim()]),
-    ),
-  );
+  try {
+    return parse<Record<string, string>>(text, {
+      columns: (headers: string[]) => {
+        const cleaned = headers.map((header) => header.trim());
+        if (new Set(cleaned).size !== cleaned.length)
+          throw new Error("Duplicate CSV column names");
+        return cleaned;
+      },
+      skip_empty_lines: true,
+      bom: true,
+      trim: true,
+    }).map((row) =>
+      Object.fromEntries(
+        Object.entries(row).map(([key, value]) => [key, value.trim()]),
+      ),
+    );
+  } catch (error) {
+    if (error instanceof CsvError)
+      throw new CsvFormatError(
+        typeof error.lines === "number" &&
+          Number.isSafeInteger(error.lines) &&
+          error.lines > 0
+          ? error.lines
+          : undefined,
+      );
+    throw error;
+  }
 }
 
 async function readCsv(path: string): Promise<Record<string, string>[]> {
@@ -55,8 +87,9 @@ export function parseBatchCsv(text: string): PrLine[] {
   return rows.map((raw, index) => {
     const parsed = prSchema.safeParse(raw);
     if (!parsed.success)
-      throw new Error(
-        `CSV row ${index + 2}: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ")}`,
+      throw new BatchCsvValidationError(
+        index + 2,
+        parsed.error.issues.map((i) => String(i.path[0])),
       );
     const row = parsed.data;
     // Accept ISO timestamps explicitly. Preserve seconds so the 24-hour boundary stays exact.
