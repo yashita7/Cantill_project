@@ -36,6 +36,7 @@ export const snapshotSchema = z.object({
   items: z.array(itemSchema),
   suppliers: z.array(supplierSchema),
   plants: z.array(z.string()),
+  plantNames: z.record(z.string(), z.string()).optional(),
   contracts: z.array(contractSchema),
   history: z.array(
     z.object({

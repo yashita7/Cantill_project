@@ -11,6 +11,8 @@ import {
   resolveDate,
   createLine,
   fieldsSchema,
+  groundChatFields,
+  differentKnownItem,
   ChatError,
   classifyChatError,
   chatRetryable,
@@ -256,6 +258,7 @@ export function chatRoutes(
         update = fieldsSchema.parse(
           await extract(message, draft, { requestId }),
         );
+        update = groundChatFields(message, update, snapshot);
         if (
           inspect(draft, snapshot, at.slice(0, 10)).ready &&
           !Object.values(update).some((value) => value?.trim())
@@ -297,6 +300,18 @@ export function chatRoutes(
       }
       try {
         const previous = inspect(draft, snapshot, at.slice(0, 10));
+        if (
+          update.description?.trim() &&
+          differentKnownItem(draft, update.description, snapshot)
+        )
+          return reply.code(409).send({
+            error:
+              "This appears to be a different item. Resolve or discard this message, then select Start new request.",
+            retryable: false,
+            draft,
+            revision: input.revision,
+            unresolvedCorrections: unresolved(),
+          });
         if (update.needBy)
           update.needBy =
             resolveDate(update.needBy, at.slice(0, 10)) ?? update.needBy;

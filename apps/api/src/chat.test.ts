@@ -69,7 +69,7 @@ it("asks for a new item description", () =>
     inspect(
       {
         ...complete,
-        fields: { ...complete.fields, description: "Laser spectrometer" },
+        fields: { ...complete.fields, description: "Laser" },
       },
       data,
       today,
@@ -162,7 +162,7 @@ it("creates one stored PR and returns it on repeated confirmation", async () => 
     const draft = await app.inject({
       method: "POST",
       url,
-      payload: { revision: 0, message: "Complete request" },
+      payload: { revision: 0, message: "Complete request PUN1 normal" },
     });
     expect(draft.json().ready).toBe(true);
     const confirmed = await app.inject({
@@ -447,7 +447,7 @@ it("blocks a failed correction until it is retried and confirms the corrected dr
   const db = drizzle(pg) as unknown as Database;
   let fail = true;
   const app = buildApp(db, undefined, "token", async (message) => {
-    if (message === "initial")
+    if (message === "initial PUN1 normal")
       return { ...complete.fields, needBy: "2099-01-01" };
     if (fail) throw new ChatError("service_unavailable", 503);
     return { quantity: "300" };
@@ -469,7 +469,7 @@ it("blocks a failed correction until it is retried and confirms the corrected dr
     const initial = await app.inject({
       method: "POST",
       url,
-      payload: { revision: 0, message: "initial" },
+      payload: { revision: 0, message: "initial PUN1 normal" },
     });
     expect(initial.json().ready).toBe(true);
     const failed = await app.inject({
@@ -549,7 +549,7 @@ it("does not allow an older in-flight correction to overwrite a newer correction
     undefined,
     "token",
     async (message) => {
-      if (message === "initial")
+      if (message === "initial PUN1 normal")
         return { ...complete.fields, needBy: "2099-01-01" };
       if (message === "older") {
         began();
@@ -575,7 +575,7 @@ it("does not allow an older in-flight correction to overwrite a newer correction
     await app.inject({
       method: "POST",
       url,
-      payload: { revision: 0, message: "initial" },
+      payload: { revision: 0, message: "initial PUN1 normal" },
     });
     const older = app.inject({
       method: "POST",
@@ -685,6 +685,112 @@ it("hides confirmation immediately and keeps it hidden after a failed correction
   expect(element("retry").hidden).toBe(false);
 });
 
+it("does not start another request while corrections are unresolved", async () => {
+  const elements = new Map<string, any>();
+  const element = (id: string): any => {
+    if (!elements.has(id))
+      elements.set(id, {
+        value: "",
+        hidden: false,
+        disabled: false,
+        textContent: "",
+        addEventListener() {},
+        append() {},
+        replaceChildren() {},
+      });
+    return elements.get(id);
+  };
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "chat", revision: 0 }),
+    })
+    .mockResolvedValueOnce({
+      ok: false,
+      json: async () => ({
+        error: "Failed",
+        retryable: true,
+        unresolvedCorrections: [{ id: "1", text: "correction" }],
+      }),
+    })
+    .mockRejectedValueOnce(new Error("offline"));
+  const script = chatPage.slice(
+    chatPage.lastIndexOf("<script>") + 8,
+    chatPage.lastIndexOf("</script>"),
+  );
+  runInNewContext(script, {
+    document: {
+      getElementById: element,
+      createElement: () => ({ append() {}, textContent: "" }),
+    },
+    workspace: { actor: "Test", save() {} },
+    localStorage: { getItem: () => "snapshot", setItem() {} },
+    fetch,
+  });
+  await element("start").onclick();
+  element("message").value = "correction";
+  element("form").onsubmit({ preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  await element("start").onclick();
+  expect(fetch).toHaveBeenCalledTimes(3);
+  expect(element("status").textContent).toContain("unresolved correction");
+});
+
+it("clears the old confirmation when a new draft starts", async () => {
+  const elements = new Map<string, any>();
+  const element = (id: string): any => {
+    if (!elements.has(id))
+      elements.set(id, {
+        value: "",
+        hidden: false,
+        disabled: false,
+        textContent: "",
+        addEventListener() {},
+        append() {},
+        replaceChildren() {},
+      });
+    return elements.get(id);
+  };
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "first", revision: 0 }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "first", revision: 1, ready: true }),
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "second", revision: 0 }),
+    });
+  const script = chatPage.slice(
+    chatPage.lastIndexOf("<script>") + 8,
+    chatPage.lastIndexOf("</script>"),
+  );
+  runInNewContext(script, {
+    document: {
+      getElementById: element,
+      createElement: () => ({ append() {}, textContent: "" }),
+    },
+    workspace: { actor: "Test", save() {} },
+    localStorage: { getItem: () => "snapshot", setItem() {} },
+    fetch,
+  });
+  await element("start").onclick();
+  element("message").value = "first";
+  element("form").onsubmit({ preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(element("confirm").hidden).toBe(false);
+  element("message").value = "old text";
+  await element("start").onclick();
+  expect(element("confirm").hidden).toBe(true);
+  expect(element("summary").hidden).toBe(true);
+  expect(element("message").value).toBe("");
+});
+
 it("keeps confirmation blocked when a newer correction fails before an older one finishes", async () => {
   const pg = new PGlite();
   await pg.exec(schemaSql);
@@ -702,7 +808,7 @@ it("keeps confirmation blocked when a newer correction fails before an older one
     undefined,
     "token",
     async (message) => {
-      if (message === "initial")
+      if (message === "initial PUN1 normal")
         return { ...complete.fields, needBy: "2099-01-01" };
       if (message === "older") {
         began();
@@ -728,7 +834,7 @@ it("keeps confirmation blocked when a newer correction fails before an older one
     await app.inject({
       method: "POST",
       url,
-      payload: { revision: 0, message: "initial" },
+      payload: { revision: 0, message: "initial PUN1 normal" },
     });
     const older = app.inject({
       method: "POST",
@@ -768,11 +874,11 @@ it("keeps multiple failed corrections until each is retried or explicitly discar
     undefined,
     "token",
     async (message) => {
-      if (message === "initial")
+      if (message === "initial PUN1 normal")
         return { ...complete.fields, needBy: "2099-01-01" };
       if (message.startsWith("fail") && failures)
         throw new ChatError("service_unavailable", 503);
-      return message === "plant" ? { plant: "CHK1" } : { quantity: "300" };
+      return message === "plant CHK1" ? { plant: "CHK1" } : { quantity: "300" };
     },
   );
   try {
@@ -791,7 +897,7 @@ it("keeps multiple failed corrections until each is retried or explicitly discar
     await app.inject({
       method: "POST",
       url,
-      payload: { revision: 0, message: "initial" },
+      payload: { revision: 0, message: "initial PUN1 normal" },
     });
     const first = await app.inject({
       method: "POST",
@@ -807,7 +913,7 @@ it("keeps multiple failed corrections until each is retried or explicitly discar
     const plant = await app.inject({
       method: "POST",
       url,
-      payload: { revision: 1, message: "plant" },
+      payload: { revision: 1, message: "plant CHK1" },
     });
     expect(plant.json()).toMatchObject({
       revision: 2,

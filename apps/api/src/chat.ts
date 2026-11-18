@@ -109,7 +109,7 @@ export function logChatFailure(
   error.logged = true;
 }
 
-function retryAfter(value: string | null): number | undefined {
+export function retryAfter(value: string | null): number | undefined {
   if (!value) return undefined;
   const seconds = Number(value);
   if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
@@ -242,6 +242,102 @@ export function advance(draft: ChatDraft, update: Fields): ChatDraft {
   };
 }
 
+// Only values explicitly present in the message or verified against the snapshot
+// may override the model's plant and urgency suggestions.
+export function groundChatFields(
+  message: string,
+  update: Fields,
+  snapshot: Snapshot,
+): Fields {
+  const result = { ...update };
+  const upper = message.toUpperCase();
+  const prefixes = [
+    ...new Set(
+      snapshot.plants
+        .map((p) => p.match(/^[A-Z]+/i)?.[0]?.toUpperCase())
+        .filter(Boolean),
+    ),
+  ];
+  const knownCodes = snapshot.plants
+    .filter((code) =>
+      new RegExp(
+        `(?<![A-Z0-9])${code.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![A-Z0-9])`,
+        "i",
+      ).test(message),
+    )
+    .map((code) => code.toUpperCase());
+  const codes = [...upper.matchAll(/\b([A-Z]{2,}\d+)\b/g)]
+    .map((m) => m[1])
+    .filter((code) => prefixes.some((prefix) => code.startsWith(prefix!)));
+  const distinctCodes = [...new Set([...knownCodes, ...codes])];
+  if (distinctCodes.length)
+    result.plant = distinctCodes.length === 1 ? distinctCodes[0] : "AMBIGUOUS";
+  else {
+    const hits = snapshot.plants.filter((code) => {
+      const name = snapshot.plantNames?.[code] ?? "";
+      const terms = name.toLowerCase().match(/[a-z]{4,}/g) ?? [];
+      return terms
+        .filter((term) => !["plant", "location"].includes(term))
+        .some((term) => new RegExp(`\\b${term}\\b`, "i").test(message));
+    });
+    if (hits.length === 1) result.plant = hits[0];
+    else if (hits.length > 1) result.plant = "AMBIGUOUS";
+    else if (
+      update.plant &&
+      new RegExp(
+        `\\b${update.plant.replace(/[^a-zA-Z0-9]/g, "")}\\b`,
+        "i",
+      ).test(message)
+    )
+      result.plant = update.plant.toUpperCase();
+    else delete result.plant;
+  }
+  const urgency = [...message.matchAll(/\b(emergency|urgent|normal)\b/gi)];
+  if (urgency.length) {
+    const last = urgency.at(-1)!;
+    const before = message
+      .slice(Math.max(0, last.index! - 5), last.index)
+      .toLowerCase();
+    if (!/\bnot\s+$/.test(before))
+      result.urgency =
+        last[0].toLowerCase() === "normal" ? "Normal" : "Emergency";
+    else delete result.urgency;
+  } else delete result.urgency;
+  return result;
+}
+
+export function differentKnownItem(
+  draft: ChatDraft,
+  description: string,
+  snapshot: Snapshot,
+): boolean {
+  if (
+    !draft.fields.description ||
+    draft.fields.description.toLowerCase() === description.toLowerCase()
+  )
+    return false;
+  const old =
+    draft.selectedItem ??
+    matchItem(
+      draft.fields.description,
+      draft.fields.uom ?? "",
+      "",
+      snapshot.items,
+    ).item_code;
+  if (!old) {
+    const before = new Set(
+      draft.fields.description.toLowerCase().match(/[a-z0-9]+/g) ?? [],
+    );
+    const after = description.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+    return Boolean(
+      (draft.fields.quantity || draft.fields.plant || draft.fields.needBy) &&
+      !after.some((word) => before.has(word)),
+    );
+  }
+  const next = matchItem(description, "", "", snapshot.items);
+  return next.item_code !== old && !next.candidates.includes(old);
+}
+
 export function inspect(draft: ChatDraft, snapshot: Snapshot, today: string) {
   const fields = draft.fields;
   const ask = (question: string, candidates: Snapshot["items"] = []) => ({
@@ -250,6 +346,10 @@ export function inspect(draft: ChatDraft, snapshot: Snapshot, today: string) {
     candidates,
     resolvedDate: null as string | null,
   });
+  if (fields.plant && !snapshot.plants.includes(fields.plant.toUpperCase()))
+    return ask(
+      "Invalid plant. Please use " + snapshot.plants.join(" or ") + ".",
+    );
   if (!fields.description?.trim())
     return ask(
       "What item do you need? Please include its size or specification.",
@@ -281,7 +381,11 @@ export function inspect(draft: ChatDraft, snapshot: Snapshot, today: string) {
   const item =
     selected ??
     snapshot.items.find((item) => item.item_code === match.item_code);
-  if (match.status === "NEW" && !draft.newDescriptionConfirmed)
+  if (
+    match.status === "NEW" &&
+    !draft.newDescriptionConfirmed &&
+    (fields.description.match(/[a-z0-9]+/gi)?.length ?? 0) < 2
+  )
     return ask("This looks like a new item. What is its full description?");
   if (!fields.uom && !item)
     return ask("What unit is the new item measured in?");
@@ -304,11 +408,8 @@ export function inspect(draft: ChatDraft, snapshot: Snapshot, today: string) {
     !new Decimal(fields.quantity).gt(0)
   )
     return ask("What quantity do you need? Enter a number greater than zero.");
-  if (
-    !["PUN1", "CHK1"].includes(fields.plant ?? "") ||
-    !snapshot.plants.includes(fields.plant!)
-  )
-    return ask("Which plant needs it, PUN1 or CHK1?");
+  if (!fields.plant || !snapshot.plants.includes(fields.plant.toUpperCase()))
+    return ask("Which plant needs it, " + snapshot.plants.join(" or ") + "?");
   const resolvedDate = resolveDate(fields.needBy ?? "", today);
   if (!resolvedDate || resolvedDate < today)
     return ask(

@@ -157,6 +157,9 @@ export function snapshotFromFiles(
     })),
     history,
     plants: plants.map((p) => p.plant),
+    plantNames: Object.fromEntries(
+      plants.filter((p) => p.name?.trim()).map((p) => [p.plant, p.name.trim()]),
+    ),
     contracts: [
       ...register.map((c) => ({
         ...c,
