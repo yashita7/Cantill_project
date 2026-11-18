@@ -92,7 +92,9 @@ it("imports external files and supports batch, run, exports and health", async (
         })
       ).statusCode,
     ).toBe(401);
-    expect((await app.inject("/")).body).toContain("Import procurement data");
+    expect((await app.inject("/setup")).body).toContain(
+      "Import procurement data",
+    );
     expect((await app.inject("/health")).json()).toEqual({
       status: "ok",
       database: "ok",

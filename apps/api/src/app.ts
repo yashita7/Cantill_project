@@ -25,6 +25,8 @@ import { buyerRoutes } from "./buyer.js";
 import { chatRoutes } from "./chat-routes.js";
 import type { ExtractChat } from "./chat.js";
 import { chatPage } from "./chat-page.js";
+import { homePage } from "./home-page.js";
+import { styles } from "./ui/styles.js";
 import { setupPage } from "./page.js";
 import { policyPage } from "./policy-page.js";
 import {
@@ -95,7 +97,13 @@ export function buildApp(
     });
     return id;
   };
-  app.get("/", async (_req, reply) => reply.type("text/html").send(setupPage));
+  app.get("/", async (_req, reply) => reply.type("text/html").send(homePage));
+  app.get("/setup", async (_req, reply) =>
+    reply.type("text/html").send(setupPage),
+  );
+  app.get("/ui.css", async (_req, reply) =>
+    reply.type("text/css").send(styles),
+  );
   app.get("/health", async (_req, reply) => {
     try {
       await db.execute(sql`SELECT 1`);
