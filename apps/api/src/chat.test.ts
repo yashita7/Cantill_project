@@ -130,20 +130,63 @@ it("keeps a draft when Gemini is down", async () => {
   }
 }, 20000);
 
-it('creates one stored PR and returns it on repeated confirmation', async () => {
- const pg=new PGlite();await pg.exec(schemaSql);
- const future={...complete.fields,needBy:'2099-01-01'};
- const app=buildApp(drizzle(pg) as unknown as Database,undefined,'token',async()=>future);
- try {
- const imported=await app.inject({method:'POST',url:'/api/snapshots',headers:{'x-setup-token':'token'},payload:{actor:{name:'Test',role:'Procurement'},snapshot:data}});
- const started=await app.inject({method:'POST',url:'/api/chat',payload:{actor:'Employee',snapshotId:imported.json().id}});
- const url='/api/chat/'+started.json().id;
- const draft=await app.inject({method:'POST',url,payload:{revision:0,message:'Complete request'}});
- expect(draft.json().ready).toBe(true);
- const confirmed=await app.inject({method:'POST',url,payload:{revision:1,confirm:true}});
- expect(confirmed.statusCode,confirmed.body).toBe(200);
- expect(confirmed.json().createdPr.pr_line).toBe('1');
- const repeated=await app.inject({method:'POST',url,payload:{revision:1,confirm:true}});
- expect(repeated.json().createdPr).toEqual(confirmed.json().createdPr);
- }finally{await app.close();await pg.close();}
-},20000);
+it("creates one stored PR and returns it on repeated confirmation", async () => {
+  const pg = new PGlite();
+  await pg.exec(schemaSql);
+  const future = { ...complete.fields, needBy: "2099-01-01" };
+  const app = buildApp(
+    drizzle(pg) as unknown as Database,
+    undefined,
+    "token",
+    async () => future,
+  );
+  try {
+    const imported = await app.inject({
+      method: "POST",
+      url: "/api/snapshots",
+      headers: { "x-setup-token": "token" },
+      payload: { actor: { name: "Test", role: "Procurement" }, snapshot: data },
+    });
+    const started = await app.inject({
+      method: "POST",
+      url: "/api/chat",
+      payload: { actor: "Employee", snapshotId: imported.json().id },
+    });
+    const url = "/api/chat/" + started.json().id;
+    const draft = await app.inject({
+      method: "POST",
+      url,
+      payload: { revision: 0, message: "Complete request" },
+    });
+    expect(draft.json().ready).toBe(true);
+    const confirmed = await app.inject({
+      method: "POST",
+      url,
+      payload: { revision: 1, confirm: true },
+    });
+    expect(confirmed.statusCode, confirmed.body).toBe(200);
+    expect(confirmed.json().createdPr.pr_line).toBe("1");
+    const repeated = await app.inject({
+      method: "POST",
+      url,
+      payload: { revision: 1, confirm: true },
+    });
+    expect(repeated.json().createdPr).toEqual(confirmed.json().createdPr);
+  } finally {
+    await app.close();
+    await pg.close();
+  }
+}, 20000);
+
+it("keeps prior answers when extraction returns empty fields", () => {
+  const draft = advance(complete, {
+    quantity: "3",
+    plant: "",
+    description: "",
+    urgency: "",
+  });
+  expect(draft.fields.plant).toBe("PUN1");
+  expect(draft.fields.description).toBe(complete.fields.description);
+  expect(draft.fields.urgency).toBe("Normal");
+  expect(draft.fields.quantity).toBe("3");
+});

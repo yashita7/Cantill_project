@@ -7,6 +7,8 @@ import { randomUUID } from "node:crypto";
 import { DateTime } from "luxon";
 import { parse } from "csv-parse/sync";
 import { Decimal } from "decimal.js";
+import { matchItem } from "@cantill/engine";
+import { snapshotFromFiles, parseCsv } from "../packages/cli/src/io.js";
 
 // Credentials stay in this process and inherited environment, never in command arguments.
 try {
@@ -52,16 +54,45 @@ async function request(path: string, init?: RequestInit) {
     );
   return response;
 }
+let lastGeminiCall = 0;
 async function post(
   path: string,
   body: unknown,
   headers: Record<string, string> = {},
 ) {
-  return request(path, {
-    method: "POST",
-    headers: { "content-type": "application/json", ...headers },
-    body: JSON.stringify(body),
-  });
+  const usesGemini =
+    path === "/api/policies/propose" ||
+    (/^\/api\/chat\/[^/]+$/.test(path) &&
+      typeof body === "object" &&
+      body !== null &&
+      "message" in body);
+  for (let attempt = 0; attempt < (usesGemini ? 3 : 1); attempt++) {
+    if (usesGemini) {
+      const delay = Math.max(0, 8000 - (Date.now() - lastGeminiCall));
+      if (delay)
+        await new Promise((resolveWait) => setTimeout(resolveWait, delay));
+      lastGeminiCall = Date.now();
+    }
+    const response = await fetch(baseUrl + path, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(60000),
+    });
+    if (response.ok) return response;
+    if (
+      usesGemini &&
+      (response.status === 503 || response.status === 422) &&
+      attempt < 2
+    ) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 12000));
+      continue;
+    }
+    throw new Error(
+      `${path.split("?")[0].replace(/\/CHAT-[^/]+/g, "/[id]")} returned HTTP ${response.status}`,
+    );
+  }
+  throw new Error("Request failed");
 }
 function rows(csv: string): Record<string, string>[] {
   return parse(csv, { columns: true, bom: true, skip_empty_lines: true });
@@ -371,45 +402,210 @@ async function main() {
       return "approval, retry and override succeeded";
     });
   else record("Buyer approve and override", "SKIP", "batch did not succeed");
-  if (process.env.GEMINI_API_KEY && process.env.GEMINI_MODEL)
-    await runStep("Chat confirmation", async () => {
-      const item = rows(items)[0];
-      const started = (await (
+  if (process.env.GEMINI_API_KEY && process.env.GEMINI_MODEL) {
+    const snapshot = snapshotFromFiles(
+      {
+        items: parseCsv(items),
+        suppliers: parseCsv(suppliers),
+        history: parseCsv(history),
+        plants: parseCsv(plants),
+        register: parseCsv(register),
+        lines: parseCsv(lines),
+        supplement,
+      },
+      "2026-11-16",
+    );
+    const item = snapshot.items[0];
+    const future = DateTime.now()
+      .setZone("Asia/Kolkata")
+      .plus({ days: 30 })
+      .toISODate();
+    type Chat = {
+      id: string;
+      revision: number;
+      ready: boolean;
+      question: string;
+      candidates: { item_code: string }[];
+      summary?: { quantity: string; item_code: string };
+      createdPr?: { pr_no: string; quantity: string };
+    };
+    const startChat = async () =>
+      (await (
         await post("/api/chat", { snapshotId, actor: "Supabase verification" })
-      ).json()) as { id: string; revision: number };
-      const future = DateTime.now()
-        .setZone("Asia/Kolkata")
-        .plus({ days: 30 })
-        .toISODate();
-      const message = `I need 1 ${item.uom} of ${item.description} for PUN1 by ${future}. Normal urgency.`;
-      let state = (await (
-        await post(`/api/chat/${started.id}`, {
-          revision: started.revision,
-          message,
+      ).json()) as Chat;
+    const send = async (chat: Chat, message: string) =>
+      (await (
+        await post(`/api/chat/${chat.id}`, { revision: chat.revision, message })
+      ).json()) as Chat;
+    const select = async (chat: Chat, candidate: string) =>
+      (await (
+        await post(`/api/chat/${chat.id}`, {
+          revision: chat.revision,
+          candidate,
         })
-      ).json()) as {
-        ready: boolean;
-        revision: number;
-        candidates: { item_code: string }[];
-      };
-      if (!state.ready && state.candidates?.length === 1)
-        state = (await (
-          await post(`/api/chat/${started.id}`, {
-            revision: state.revision,
-            candidate: state.candidates[0].item_code,
-          })
-        ).json()) as typeof state;
-      assert(state.ready, "Chat requires an additional answer");
-      const confirmed = (await (
-        await post(`/api/chat/${started.id}`, {
-          revision: state.revision,
+      ).json()) as Chat;
+    const confirm = async (chat: Chat) =>
+      (await (
+        await post(`/api/chat/${chat.id}`, {
+          revision: chat.revision,
           confirm: true,
         })
-      ).json()) as { createdPr: { pr_no: string } };
-      assert(!!confirmed.createdPr?.pr_no, "Chat did not create a PR");
-      return "chat PR confirmed";
+      ).json()) as Chat;
+    const text = (quantity: string) =>
+      `I need ${quantity} ${item.uom} of ${item.description} for PUN1 by ${future}. Normal urgency.`;
+    await runStep("Chat complete request", async () => {
+      let chat = await send(await startChat(), text("2"));
+      if (
+        !chat.ready &&
+        chat.candidates?.some(
+          (candidate) => candidate.item_code === item.item_code,
+        )
+      )
+        chat = await select(chat, item.item_code);
+      assert(
+        chat.ready &&
+          chat.summary?.item_code === item.item_code &&
+          chat.summary.quantity === "2",
+        "Complete request was not understood correctly",
+      );
+      chat = await confirm(chat);
+      assert(!!chat.createdPr?.pr_no, "PR was not created");
+      return "confirmed";
     });
-  else record("Chat confirmation", "SKIP", "Gemini key and model are required");
+    await runStep("Chat missing quantity", async () => {
+      let chat = await send(
+        await startChat(),
+        `I need ${item.description}, unit ${item.uom}, for PUN1 by ${future}. Normal urgency. I have not decided the quantity.`,
+      );
+      if (
+        chat.candidates?.some(
+          (candidate) => candidate.item_code === item.item_code,
+        )
+      )
+        chat = await select(chat, item.item_code);
+      assert(
+        !chat.ready && /quantity/i.test(chat.question),
+        "Expected a quantity follow-up",
+      );
+      chat = await send(chat, "The quantity is 3.");
+      // The model may omit other fields from the first message. Answer any
+      // subsequent questions instead of treating an incomplete draft as ready.
+      for (let i = 0; i < 3 && !chat.ready; i++) {
+        if (/plant/i.test(chat.question))
+          chat = await send(chat, "The plant is PUN1.");
+        else if (/when|date/i.test(chat.question))
+          chat = await send(chat, `The need-by date is ${future}.`);
+        else if (/normal|emergency/i.test(chat.question))
+          chat = await send(chat, "The urgency is Normal.");
+        else break;
+      }
+      assert(
+        chat.ready && chat.summary?.quantity === "3",
+        "Quantity follow-up was not retained",
+      );
+      chat = await confirm(chat);
+      assert(!!chat.createdPr?.pr_no, "PR was not created");
+      return "follow-up and confirmation passed";
+    });
+    await runStep("Chat ambiguous item", async () => {
+      const variants = snapshot.items.flatMap((entry) =>
+        entry.description
+          .split(/\s+/)
+          .slice(1, -1)
+          .map((_, i) => ({
+            description: entry.description
+              .split(/\s+/)
+              .slice(0, i + 1)
+              .join(" "),
+            uom: entry.uom,
+          })),
+      );
+      const ambiguous = variants.find(
+        (entry) =>
+          matchItem(entry.description, entry.uom, "", snapshot.items).candidates
+            .length >= 2,
+      );
+      assert(ambiguous, "No ambiguous item fixture found in snapshot");
+      let chat = await send(
+        await startChat(),
+        `I need 2 ${ambiguous.uom} of ${ambiguous.description} for PUN1 by ${future}. Normal urgency.`,
+      );
+      assert(
+        !chat.ready && chat.candidates?.length >= 2,
+        "Expected multiple item candidates",
+      );
+      const chosen = chat.candidates[0].item_code;
+      chat = await select(chat, chosen);
+      assert(
+        chat.ready && chat.summary?.item_code === chosen,
+        "Candidate selection did not resolve the item",
+      );
+      chat = await confirm(chat);
+      assert(!!chat.createdPr?.pr_no, "PR was not created");
+      return "candidate selected and confirmed";
+    });
+    await runStep("Chat quantity correction", async () => {
+      let chat = await send(await startChat(), text("2"));
+      if (
+        !chat.ready &&
+        chat.candidates?.some(
+          (candidate) => candidate.item_code === item.item_code,
+        )
+      )
+        chat = await select(chat, item.item_code);
+      assert(chat.ready, "Initial request is incomplete");
+      chat = await send(chat, "Make it 300.");
+      assert(
+        chat.ready && chat.summary?.quantity === "300",
+        "Correction did not update quantity",
+      );
+      chat = await confirm(chat);
+      assert(
+        chat.createdPr?.quantity === "300",
+        "Confirmed PR lost correction",
+      );
+      return "correction confirmed";
+    });
+    await runStep("Policy chat extraction", async () => {
+      const draft = baseline.versions.find(
+        (p: { version: string }) => p.version === "5.0",
+      );
+      const newLimit = new Decimal(draft.parameters.limits.spot)
+        .plus(12345)
+        .toString();
+      const proposed = (await (
+        await post("/api/policies/propose", {
+          baseVersion: "5.0",
+          source: {
+            kind: "chat",
+            text: `Create version live-check-1, effective 2099-02-01. Set the spot limit to ${newLimit}.`,
+          },
+        })
+      ).json()) as {
+        draft: {
+          version: string;
+          effective_date: string;
+          parameters: { limits: { spot: string } };
+        };
+      };
+      assert(
+        proposed.draft.version === "live-check-1" &&
+          proposed.draft.effective_date === "2099-02-01" &&
+          proposed.draft.parameters.limits.spot === newLimit,
+        "Proposal did not contain the requested amendment",
+      );
+      return "synthetic change extracted";
+    });
+  } else {
+    for (const name of [
+      "Chat complete request",
+      "Chat missing quantity",
+      "Chat ambiguous item",
+      "Chat quantity correction",
+      "Policy chat extraction",
+    ])
+      record(name, "SKIP", "Gemini key and model are required");
+  }
   if (process.env.GEMINI_API_KEY) {
     const check = spawnSync("npm", ["run", "check:gemini"], {
       cwd: root,

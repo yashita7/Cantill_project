@@ -39,7 +39,7 @@ export function geminiChat(apiKey: string, model: string): ExtractChat {
       contents: JSON.stringify({ message, draft }),
       config: {
         systemInstruction:
-          "Extract only fields explicitly supplied or corrected by the user in this message. Return a partial update. Never invent item codes, units, prices, quantities or dates. Preserve relative date wording verbatim in needBy. For a short answer use the draft's missing fields as context. 'make it 300' corrects quantity. Use Normal or Emergency only when the wording supplies that urgency.",
+          "Extract every field explicitly supplied or corrected by the user in this message, including plant codes such as PUN1 or CHK1 and need-by dates. Return a partial update. Never invent item codes, units, prices, quantities or dates. Preserve relative date wording verbatim in needBy. For a short answer use the draft's missing fields as context. 'make it 300' corrects quantity. Use Normal or Emergency only when the wording supplies that urgency.",
         responseMimeType: "application/json",
         responseJsonSchema: z.toJSONSchema(fieldsSchema),
       },
@@ -73,13 +73,23 @@ export function resolveDate(value: string, today: string): string | null {
 }
 
 export function advance(draft: ChatDraft, update: Fields): ChatDraft {
-  const fields = { ...draft.fields, ...update };
+  // Structured output may contain empty strings for fields the user did not mention.
+  // Keep the previous answer instead of erasing it on a follow-up.
+  const supplied = Object.fromEntries(
+    Object.entries(update).filter(
+      ([, value]) => value !== undefined && value.trim() !== "",
+    ),
+  ) as Fields;
+  const fields = { ...draft.fields, ...supplied };
+  const descriptionChanged =
+    supplied.description !== undefined &&
+    supplied.description !== draft.fields.description;
   return {
     fields,
-    selectedItem:
-      update.description !== undefined ? undefined : draft.selectedItem,
-    newDescriptionConfirmed:
-      update.description !== undefined ? true : draft.newDescriptionConfirmed,
+    selectedItem: descriptionChanged ? undefined : draft.selectedItem,
+    newDescriptionConfirmed: descriptionChanged
+      ? true
+      : draft.newDescriptionConfirmed,
   };
 }
 
@@ -129,7 +139,9 @@ export function inspect(draft: ChatDraft, snapshot: Snapshot, today: string) {
   const unit = fields.uom?.toUpperCase() ?? item?.uom;
   if (item && unit !== item.uom)
     return ask(
-      "Please set the unit to " + item.uom + ". What quantity do you need in that unit?",
+      "Please set the unit to " +
+        item.uom +
+        ". What quantity do you need in that unit?",
     );
   if (!item && !snapshot.items.some((entry) => entry.uom === unit))
     return ask(

@@ -32,13 +32,11 @@ export function chatRoutes(
       );
     if (!snapshot) throw new Error("Snapshot not found");
     const id = randomUUID();
-    await db
-      .insert(records)
-      .values({
-        id,
-        kind: "chat",
-        data: { ...input, draft: { fields: {} }, revision: 0 },
-      });
+    await db.insert(records).values({
+      id,
+      kind: "chat",
+      data: { ...input, draft: { fields: {} }, revision: 0 },
+    });
     return { id, revision: 0, question: "What item do you need?" };
   });
   app.post("/api/chat/:id", async (req, reply) => {
@@ -98,24 +96,29 @@ export function chatRoutes(
         if (!extract) throw new Error("Unavailable");
         const update = fieldsSchema.parse(await extract(input.message, draft));
         const previous = inspect(draft, snapshot, at.slice(0, 10));
-        if (update.needBy) update.needBy = resolveDate(update.needBy, at.slice(0,10)) ?? update.needBy;
+        if (update.needBy)
+          update.needBy =
+            resolveDate(update.needBy, at.slice(0, 10)) ?? update.needBy;
         draft = advance(draft, update);
         if (
-          update.description &&
+          update.description?.trim() &&
           previous.question.includes("full description")
         )
           draft.newDescriptionConfirmed = true;
-        else if (update.description) draft.newDescriptionConfirmed = false;
+        else if (
+          update.description?.trim() &&
+          update.description !==
+            (row.data.draft as ChatDraft).fields.description
+        )
+          draft.newDescriptionConfirmed = false;
       } catch {
-        return reply
-          .code(503)
-          .send({
-            error:
-              "Gemini is unavailable or its quota is exhausted. Your draft is saved. Retry this message.",
-            retryable: true,
-            draft,
-            revision: input.revision,
-          });
+        return reply.code(503).send({
+          error:
+            "Gemini is unavailable or its quota is exhausted. Your draft is saved. Retry this message.",
+          retryable: true,
+          draft,
+          revision: input.revision,
+        });
       }
     }
     const revision = input.revision + 1;
@@ -128,25 +131,21 @@ export function chatRoutes(
         .returning();
       if (!updated.length) return false;
       if (createdPr) {
-        await tx
-          .insert(records)
-          .values({
-            id: createdPr.pr_no,
-            kind: "pr",
-            data: { snapshotId: row.data.snapshotId, lines: [createdPr] },
-          });
-        await tx
-          .insert(records)
-          .values({
-            id: randomUUID(),
-            kind: "audit",
-            data: {
-              action: "create_pr",
-              actor: row.data.actor,
-              at,
-              target: createdPr.pr_no,
-            },
-          });
+        await tx.insert(records).values({
+          id: createdPr.pr_no,
+          kind: "pr",
+          data: { snapshotId: row.data.snapshotId, lines: [createdPr] },
+        });
+        await tx.insert(records).values({
+          id: randomUUID(),
+          kind: "audit",
+          data: {
+            action: "create_pr",
+            actor: row.data.actor,
+            at,
+            target: createdPr.pr_no,
+          },
+        });
       }
       return true;
     });
