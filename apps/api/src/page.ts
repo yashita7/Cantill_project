@@ -1,0 +1,10 @@
+export const setupPage = `<!doctype html><html><head><meta charset="utf-8"><title>Procurement setup</title></head><body>
+<nav><a href="/buyer">Buyer workspace</a> <a href="/chat">Employee request</a> <a href="/policies">Policies and batch runs</a></nav>
+<h1>Import procurement data</h1><p>Files are sent to this server and saved in its database. The supplement must be a JSON array of contracts.</p>
+<form id="setup"><label>Setup token <input name="token" type="password" required autocomplete="off"></label><br><label>Actor <input name="actor" required></label><br><label>Snapshot date <input type="date" name="date" required></label><br>
+<label>Item master CSV <input name="items" type="file" required></label><br><label>Supplier master CSV <input name="suppliers" type="file" required></label><br>
+<label>PO history CSV <input name="history" type="file" required></label><br><label>Plants CSV <input name="plants" type="file" required></label><br>
+<label>Contract register CSV <input name="register" type="file" required></label><br><label>Contract lines CSV <input name="lines" type="file" required></label><br>
+<label>Initial policy v5.0 JSON <input name="policy" type="file" accept=".json"></label><br>
+<label>Contract supplement JSON <input name="supplement" type="file" required></label><br><button>Import</button></form><pre id="result"></pre>
+<script>document.querySelector('#setup').onsubmit=async e=>{e.preventDefault();const form=e.target;const out=document.querySelector('#result');try{const names=['items','suppliers','history','plants','register','lines','supplement'];const files=Object.fromEntries(await Promise.all(names.map(async n=>[n,await form.elements[n].files[0].text()])));if(form.elements.policy.files[0]) files.policy=await form.elements.policy.files[0].text();const r=await fetch('/api/setup',{method:'POST',headers:{'content-type':'application/json','x-setup-token':form.elements.token.value},body:JSON.stringify({actor:{name:form.elements.actor.value,role:'Procurement'},asOf:form.elements.date.value,files})});out.textContent=JSON.stringify(await r.json(),null,2);}catch(err){out.textContent=String(err)}};</script></body></html>`;
