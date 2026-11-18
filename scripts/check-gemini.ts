@@ -4,7 +4,7 @@ import { geminiExtractor, parseDraft } from "../apps/api/src/policies.js";
 
 try {
   try {
-    loadEnvFile();
+    if (!process.env.VERIFY_SUPABASE_CHILD) loadEnvFile();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }

@@ -15,7 +15,8 @@
     "build": "esbuild apps/api/src/server.ts --bundle --platform=node --format=esm --target=node22 --packages=external --alias:@cantill/engine=./packages/engine/src/index.ts --outfile=dist/server.js",
     "dev": "node --import tsx apps/api/src/server.ts",
     "check:gemini": "node --import tsx scripts/check-gemini.ts",
-    "verify:local": "node --import tsx scripts/verify-local.ts"
+    "verify:local": "node --import tsx scripts/verify-local.ts",
+    "verify:supabase": "node --import tsx scripts/verify-supabase.ts"
   },
   "engines": {
     "node": ">=22"
