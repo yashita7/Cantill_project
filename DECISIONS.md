@@ -128,3 +128,10 @@ action. Overrides require a comment and preserve original decisions. The stack
 uses Fastify, Drizzle with PostgreSQL numeric strings, React/Vite, Zod, and the
 official Gemini TypeScript SDK. Supabase supplies plain PostgreSQL. Persistence
 and application screens are the next milestone.
+
+## Blind test notes
+
+- The hosted PDF extraction failed. A v5.1 proposal was requested through the app's chat feature; the approved JSON draft was manually corrected and reviewed against amendment clauses A1, A2 and A3 before approval.
+- A1 changes the spot limit in rule 5.4 and, unlike A3, does not state that it overrides emergency POs. The Packaging rule was corrected to apply after emergency rule 5.3 as version `5.1-corrected`, because the app cannot re-approve or retire version `5.1`.
+- Policy version is chosen by requirement date. Under clause 2.3, that is the date of the first line, so 12 lines dated on or after 1 December that are clubbed into requirements starting earlier remain under v5.0.
+- To repeat: Run 1 uses **explicit approved version** `5.0`; Run 2 uses **as of requirement date**; preferred suppliers are exported as of `2026-12-01`. Run 2 reasons contain the label `5.1-corrected` for the corrected policy.
